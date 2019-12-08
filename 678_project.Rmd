@@ -1,0 +1,382 @@
+---
+title: "678 project"
+author: "Jingning Yang"
+date: "12/7/2019"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+library(RJSONIO)
+library(jsonlite)
+library(magick)
+library(lme4)
+library(stringr)
+library(tidyverse)
+library(corrplot)
+library(psych)
+library(RColorBrewer)
+library(dplyr)
+library(tidytext)
+library(RColorBrewer)
+library(wordcloud)
+library(wordcloud2)
+library('tm')
+```
+
+We use the dataset provided by Yelp as part of their Dataset Challenge 2019. The dataset includes data from 36 states in United States. It contains information about 158525 business and business attributes, 6685900 reviews and so on. Summarize, the dataset consists of five json files: business, review, user, check-in and tip. 
+
+Since our dataset too large to run in local, this file is run in our MSSP server.
+
+## Import Yelp Data: Business + Review
+
+I will only use business.json and review.json for this report. And my goal is try to figure out based on stars, is there any particular standard or requirement for a "good" restaurant(stars >=4) in different states? And it may help business change their stars in short term by paying more attention on those standard/requirement in different states. Also it may help visitors recognize variety taste of each states so that they can avoid the situation: go to restaurants with high stars, but do not like its taste at all.    
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+rm(list=ls())
+rev<- "/project/mssphw1/yelpmssp/review.json"
+invisible(review <- jsonlite::stream_in(textConnection(readLines(rev)), verbose = F))
+invisible(business <- jsonlite::stream_in(file("/project/mssphw1/yelpmssp/business.json"),verbose = F))
+```
+
+## Clean Yelp Business Data
+For business file, we only focus on stars, attributes, states and review counts, thus we delete other useless data.
+```{r pressure, echo=FALSE}
+#Remove useless variables in datasets base on our objective: 
+business <- business %>% select(-starts_with("hours"), -city, -address, -postal_code, -latitude, -longitude) %>% filter(is_open==1) 
+#Maybe check the length of opening hours per day/week later.
+
+#Select restaurants in the yelp_tb1 dataset:
+restaurant <- business %>% filter(str_detect(categories, "Restaurants"))
+
+#Delete data of state where have less than 20 restaurants information:
+states <- data.frame(table(restaurant$state))
+rows <- restaurant$state %in% states[states$Freq > 20, 1]
+restaurant1 <- restaurant[rows, ]
+
+#Delete the row of restaurants whose attributes are all NAs:
+restaurant1 <- restaurant1[rowSums(is.na(restaurant1$attributes)) != ncol(restaurant1$attributes), ]
+
+#Create new data frame including information of data frame attributes:
+att <- data.frame(apply(restaurant1$attributes, 2, function(x) as.numeric(as.factor(x)))) #assign non NAs anwers to numeric
+att[is.na(att)] <- 0 #assign NAs to 0
+att$stars <- restaurant1$stars
+#att <- apply(att,2,function(x) as.numeric(as.factor(x)))
+att <- att %>% select(-GoodForMeal, -BusinessParking, -Music, -BestNights, -Ambience, -NoiseLevel, -WiFi, -Alcohol, -RestaurantsAttire, -BYOBCorkage)
+att$reviewcount <- restaurant1$review_count
+```
+
+## EDA for business data
+By detecting correlated variables, following plots can let us find some interesting correlations between variables:    
+```{r, echo=FALSE}
+C <-cor(att,method = "spearman")
+corrplot(C,type="upper", order="hclust",tl.cex = 0.5, tl.col = "black", tl.srt = 45)
+```
+
+We can see the relationship of other variables with stars are not too strong.
+
+Now, we try to illustrate is there any relationship between review count and stars in different stars:   
+```{r, echo=FALSE}
+att$state <- restaurant1$state
+ggplot(att) +
+  geom_point(aes(x=stars, y=reviewcount), stat = "identity",alpha=0.3) +
+  facet_grid(.~state) +scale_y_log10()
+```
+
+Through this graph, we can see there is about positive correlation between review count and stars in different states.
+
+## Using PCA to reduce our dimension of attributes
+Because of there are correlation between each variables as our corrlation plot shows previously, we try PCA here to reduce the dimension so that we can choose independent variables into our model as predictors.      
+
+```{r, echo=FALSE, warning=FALSE}
+#head(round(C,2))
+att <- select(att, -state)
+cortest.bartlett(att)
+det(C) 
+```
+From output data, Bartlett's test is highly significant, assymptotically chisquare is 235979.1, and P-value of chi square smaller than 0.001, therefore factor analysis is appropriate.     
+
+And since the determinant is 0.001 larger than 0.00001, so our determinant does not seem problematic.    
+
+Since my goal is reduce number of variables in my data by extracting important one from the data, thus, I will using PCA to do factor extraction.
+
+# Factor extraction by using PCA:
+```{r, echo=FALSE, message=FALSE}
+pc <- principal(att, nfactors = 31, rotate="none")
+#parallel <- fa.parallel(att, fm='minres', fa='fa', main = "Scree Plot")
+plot(pc$values, type="b", main = "Scree Plot") 
+```
+From the Scree plot, x axis: component number, y axis:eigenvalues of principal components and factor analysis.      
+
+Since the elbow part is about the 4th point from the left, so the evidence from the scree plot and from the eigenvalues suggests 4 component solution may be the best.    
+
+Thus, we choose 4 as our number of factors.    
+
+# Redo PCA by using 3 factors:
+```{r, echo=FALSE}
+pc2 <- principal(att, nfactors = 4, rotate="none")
+```
+Through output data, Cumulative variable shows these 4 principle components explains 34% data with 31 variables. Specific output table placed in Appendix.     
+
+For easier to explain the output of factor extraction, we can using orthogonal rotation to decreasing noice for factors as much as possible.         
+
+# Orthogonal rotation(varimaax):
+```{r, echo=FALSE}
+pc3 <- principal(att, nfactors = 4, rotate = "varimax")
+#print.psych(pc3, cut=0.3, sort = TRUE, main="table after orthogonal rotation") #cut=0.3:only loading above 0.3, otherwise correlation is not high enough, so we consider excluding them.
+fa.diagram(pc3,simple=TRUE)
+```
+From the graph, we can see 30 variables can separated as 4 groups, and "stars" belongs to the RC4.         
+
+Thus, we can choose other 3 variables as predictor in our model from RC1, RC2 and RC3 which has highest correlation coefficient in its RC.         
+
+
+## Model multilevel model in business file based on our EDA graphs:
+```{r, echo=FALSE, warning=FALSE}
+att$state <- restaurant1$state
+formula_bs <- "stars~RestaurantsReservations+(1+RestaurantsGoodForGroups+HappyHour+RestaurantsReservations|state)+RestaurantsGoodForGroups+HappyHour"
+fit_bs <- lmer(formula = formula_bs, data = att)
+#summary(fit_bs)
+round(coef(fit_bs)$state,2) 
+```
+As the table shows, we can get functions for each states:        
+For state AB, stars = 3.32 + 0.09*RestaurantsReservations - 0.01*restaurantsGoodForGroups + 0.02*HappyHour.  
+And functions for other states are same logical with state AB.        
+
+## Model checking
+```{r,echo=FALSE}
+#plot(fitted(fit_bs), resid(fit_bs, type="pearson"), col="blue")
+plot(resid(fit_bs, type="pearson"))
+```
+From this plot, we can see the residuals randomly around y=0 and this suggests that the assumption that the relationship is linear is reasonable. 
+
+For more specific information for each states:       
+
+```{r, echo=FALSE}
+ggplot(fit_bs, aes(x=fitted(fit_bs), y=resid(fit_bs, type="pearson"))) +
+  facet_grid(~state) +
+  geom_point(aes(color = state)) +
+  geom_smooth(method = 'lm', se=TRUE, aes(color=state))
+```
+This difference pattern means our response might be categorical number in dataset, and the response in our model is continuous, therefore this pattern occurs. As we can see in plot, most lines are horizontal at y=0. That means our assumption that the relationship is linear is reasonable as well.          
+
+QQ-plot of this model in Appendix part.     
+
+## Try to test accuracy of multilevel model by split data into train and test dataset with ratio 6:4
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+#install.packages("caret")
+#set.seed(7)
+require(caret)
+folds <- createFolds(att$stars, k=10)
+l <- 1
+accuracy <- as.numeric()
+for(i in 1:10){
+  fold_test <- att[folds[[i]],]   #folds[[i]] as test dataset
+  fold_train <- att[-folds[[i]],]   # rest are train dataset
+  model <- lmer(formula = formula_bs, data = fold_train)
+  fold_predict <- round(predict(model,newdata=fold_test),1)
+  fold_test$predict = fold_predict
+  fold_error = fold_test$predict-fold_test$stars 
+  MSE <- mean((fold_test$stars - fold_test$predict)^2) #calculate MSE for each fold
+  accuracy[[l]] <- MSE
+  l <- l+1
+  }
+accuracy <- mean(accuracy)
+print("the mean our our 10 MSE is: ")
+accuracy
+```
+Since our accuracy of the model by using 10-fold cross validation is 63.4%, thus our model is kind of not good enough to cover most information in the whole dataset.    
+
+# After model checking,try explain the result of model and explore it in orginial dataset.    
+As previously table shows, we can get functions for each states:    
+```{r, echo=FALSE}
+round(coef(fit_bs)$state,2)
+```
+First, we can see the largest coefficent of Restaurants reservations is in state NV which is 0.21, and the lowest coefficient of it is in state QC which is 0.03. That means, restaurants reservations affect the stars of restaurants in AZ more than in QC.    
+
+And we can explore it in the original dataset:    
+
+```{r, echo=FALSE}
+ggplot(subset(restaurant1, state %in% c("NV", "QC")), aes(x=attributes$RestaurantsReservations, fill = as.factor(stars))) +
+  geom_bar(position = "fill") +
+  facet_grid(.~state) + 
+  labs(x="Restaurants reservations")
+```
+
+From this graph, we can see the difference between NV and QC, in QC, no matter which kind of restaurants reservations are, the largest portion always blue(star=4), and in NV, only when restaurants reservations is "True", we can see the largest portion is blue(star=4) apparently. That's why the result of our model said different kind of restaurants reservations affect restaurant stars in NV more than in QC.
+
+Second, for coefficient of RestaurantsGoodForGroups are kind of really similar between each states since the maximum is 0 in NC and minimum is -0.06 in AZ. From the following plot, we can see the ratio of stars in different kind of "restaurants good for groups" in 2 states are pretty close, and it's hard to find a pattern between them that can explain why the difference of coefficent of RestaurantsGoodForGroups from our model is small.     
+```{r, echo=FALSE}
+ggplot(subset(restaurant1, state %in% c("NC", "AZ")), aes(x=attributes$RestaurantsGoodForGroups, fill = as.factor(stars))) +
+  geom_bar(position = "fill") +
+  facet_grid(.~state) + 
+  labs(x="Restaurants good for groups")
+```
+Third, the difference of coefficient in HappyHour is small as well, maximum is 0.06 in NV and minimum is 0 in ON. And I will place related plots in Appendix part. 
+
+Consequently, for most stats, there are no apparently standard/requirement for a "good" restaurants from attrbution part.      
+
+# Next, is there any taste preference for a "good" restaurants in different states from our reveiw.json file? 
+## Match reviews to each restaurant in business file: 
+We try to figure out the top number of restaurants in every states:        
+
+```{r, echo=FALSE, warning=FALSE}
+a <- business %>% select(-starts_with("hours"), -starts_with("attribute")) %>%
+ filter(str_detect(categories, "Restaurant")) %>%
+ unnest(categories) %>%
+ filter(categories != "Restaurants") %>%
+ count(state, categories) %>%
+ filter(n > 10) %>%
+ group_by(state) %>%
+ top_n(1, n)
+a$categories[a$categories == "Restaurants, Pizza"] <- "Pizza, Restaurants"
+ggplot(a, aes(x=state, y=n, fill=categories)) +
+  geom_bar(stat = "identity") +
+  labs(y="Number of restaurants")
+```
+From this plot, we can see there are 3 top number of restaurants: Chinese, Mexican and Pizza.      
+Therefore, we can make a guess: 
+Mexican restaurants are popular in state AZ and NV. Pizza restauratns are polupar in state AB, OH, PA, QC and WI.  Chinese restaurants are popular in state IL, NC and ON.   
+
+Next, we can check our guess through text mining through review information in different states.    
+```{r, echo=FALSE, message=FALSE}
+att$business_id <- restaurant1$business_id
+att <- select(att, business_id, state, stars)
+review <- select(review, review_id, business_id, text)
+new <- merge(att, review, by="business_id")
+```
+
+# Text mining for feature reviews of restaurants with high stars(4~5) in different states.
+```{r, echo=FALSE}
+#Subset for each state:
+AZ <- subset(new, stars > 4 & state == "AZ")
+ON <- subset(new, stars > 4 & state == 'ON')
+NV <- subset(new, stars > 4 & state == 'NV')
+QC <- subset(new, stars > 4 & state == 'QC')
+AB <- subset(new, stars > 4 & state == 'AB')
+PA <- subset(new, stars > 4 & state == 'PA')
+NC <- subset(new, stars > 4 & state == 'NC')
+OH <- subset(new, stars > 4 & state == 'OH')
+SC <- subset(new, stars > 4 & state == 'SC')
+WI <- subset(new, stars > 4 & state == 'WI')
+IL <- subset(new, stars > 4 & state == 'IL')
+```
+Wordcloud for review features of good restaurants(stars > 4) in IL:  
+```{r, echo=FALSE}
+
+ILr <- IL %>% unnest_tokens(bigram, text, token = "ngrams", n = 2)
+seperate <- ILr %>% 
+  count(bigram, sort = TRUE) %>% 
+  separate(bigram, c("word1", "word2"), sep = " ") 
+unite <- seperate%>% 
+  filter(!word1 %in% stop_words$word) %>% #remove cases where either is a stop-word.
+  filter(!word2 %in% stop_words$word) %>% 
+  unite(bigram, word1, word2, sep = " ") %>% head(50)
+#wordcloud(unite$bigram, unite$n,scale = c(1.5,0.5),max.words=120,random.order = F,colors=brewer.pal(8, "Dark2"))
+wordcloud2(unite, shape = 'circle' ,color = "random-light", size = 0.3, backgroundColor = "white")
+
+```
+From the plot, the highest frequency of words are: mexican food, black dog, pulled pork, chinese food, ice cream, sweet potato and so on. Therefore, we can say people in IL love mexican and chinese food that same with our guess.      
+And the interesting thing is why "black dog" will become one the top frequency review word in restaurants with high stars?       
+After we find some reviews inlcuding Balck Dog:         
+Big fan of Black Dog.      
+Black Dog all you need to know is it is scary good    
+Black Dog clearly does bbq right.    
+Black Dog has so much good food & good beer.     
+and so on...       
+From these reviews, we have an idea that Black Dog is the name of a restaurant in IL, and that restaurants is pretty popular. 
+
+Wordcloud for review features of good restaurants in ON:      
+```{r, echo=FALSE}
+ONr <- ON %>% unnest_tokens(bigram, text, token = "ngrams", n = 2)
+seperate1 <- ONr %>% 
+  count(bigram, sort = TRUE) %>% 
+  separate(bigram, c("word1", "word2"), sep = " ") 
+unite1 <- seperate1 %>% 
+  filter(!word1 %in% stop_words$word) %>% #remove cases where either is a stop-word.
+  filter(!word2 %in% stop_words$word) %>% 
+  unite(bigram, word1, word2, sep = " ") %>% 
+  head(50)
+# wordcloud(unite1$bigram, unite1$n,scale = c(1.5,0.5),max.words=120,random.order = F,colors=brewer.pal(8, "Dark2"))
+
+wordcloud2(unite1, shape = 'circle' ,color = "random-light", size = 0.3, backgroundColor = "white")
+```
+From the plot, the highest frequency of words are: ice cream, pad thai, banh mi, pork belly, customer service, jerk chicken, super friendly and so on. Looks like people in ON love thai food and attention on customer service.  
+
+We will go back to our dataset and have a look those reviews including pad thai:      
+Yummy yummy Thai food! We ordered take-out.        
+Yummy Thai food but super hard to get into      
+Yum!!! Love their chicken pad thai!        
+and so on......         
+Most reviews including pad thai are say love thai food, therefore, people in ON love thai food as well, and since the top number of restaurants is chinese food, maybe new business can consider open a thai restaurants.
+
+
+Wordcloud for review features of good restaurants in AB:        
+```{r, echo=FALSE}
+ABr <- AB %>% unnest_tokens(bigram, text, token = "ngrams", n = 2)
+seperate2 <- ABr %>% 
+  count(bigram, sort = TRUE) %>% 
+  separate(bigram, c("word1", "word2"), sep = " ") 
+unite2 <- seperate2 %>% 
+  filter(!word1 %in% stop_words$word) %>% #remove cases where either is a stop-word.
+  filter(!word2 %in% stop_words$word) %>% 
+  unite(bigram, word1, word2, sep = " ") %>% 
+  head(50)
+# wordcloud(unite2$bigram, unite2$n,scale = c(1.5,0.5),max.words=120,random.order = F,colors=brewer.pal(8, "Dark2"))
+wordcloud2(unite2, shape = 'circle' ,color = "random-light", size = 0.3, backgroundColor = "white")
+```
+From the plot, the highest frequency of words are: super friendly, friendly staff, spring rolls, glutten free, friendly service, french toast, customer service, indian food and so on. Looks like people in AB love indian food and french toast.
+
+Let's see specific reviews including these words:       
+Delicious stuffed French toast!      
+Probably the best French toast I have tried in Calgary      
+Wow! I thought I wouldn't find better Indian food.       
+We have had the Indian food here which is good       
+and so on....       
+Therefore, we may say people in AB love indian food and french toast even though the number of pizza restaurants are the most.          
+
+Wordcloud for review features of good restaurants in NV:         
+```{r, echo=FALSE}
+NVr <- NV %>% unnest_tokens(bigram, text, token = "ngrams", n = 2)
+seperate3 <- NVr %>% 
+  count(bigram, sort = TRUE) %>% 
+  separate(bigram, c("word1", "word2"), sep = " ") 
+unite3 <- seperate3 %>% 
+  filter(!word1 %in% stop_words$word) %>% #remove cases where either is a stop-word.
+  filter(!word2 %in% stop_words$word) %>% 
+  unite(bigram, word1, word2, sep = " ") %>% 
+  head(50)
+# wordcloud(unite3$bigram, unite3$n,scale = c(1.5,0.5),max.words=120,random.order = F,colors=brewer.pal(8, "Dark2"))
+wordcloud2(unite3, shape = 'circle' ,color = "random-light", size = 0.3, backgroundColor = "white")
+```
+From the plot, the highest frequency of words are: las vegas, customer service, ice cream, happy hour, fried chicken, friendly staff, super friendly, fried rice and so on. Looks like people in NV attention on customer service, love las vegas and fried chicken.        
+
+From some reviews including these words:       
+Yummy! The fried chicken is so delicious.      
+Yummy korean fried chicken.        
+You gotta love fried chicken!!!             
+This is the best Korean food in North Las Vegas     
+The Best Sushi Restaurant in Las Vegas       
+THE NUMBER ONE BUFFET IN THE LAS VEGAS      
+and so on....   
+Therefore, we can make a hypothesis that many people eat food in las vegas and love fried chicken and so on food.         
+
+Same logic for rest states. And through previously analysis, we know that the top number of restaurants not represent the taste preference of people. And it shows the importance of the frequency of review word that illustrate what customers thought, feeling and focusing on. From previously text mining for some states, we know customers love ice cream, focus on customer service no matter which states they are coming from.Thus, maybe restaurants business can pay more attention on these general points, and improving more based on specific preference of different states.        
+
+PS: results of the top freqency of review words of rest states are in Appendix part, welcome to check them if interested in.
+
+# Appendix 
+Summary information of redo PCA:     
+```{r}
+pc2
+```
+
+For the multilevel summary information:
+```{r}
+summary(fit_bs)
+```
+
+QQ plot of our model:    
+```{r, echo=FALSE, message=FALSE}
+qqnorm(resid(fit_bs))
+```
+
